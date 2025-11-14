@@ -1,0 +1,20 @@
+# Virtual environment
+.venv/
+
+# Env file containing secrets
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Private keys
+certs/*.key.pem
+certs/**/*.key.pem
+
+# Transcripts should not be committed (session logs)
+transcripts/*
+
+# OS / Editor junk
+.DS_Store
+Thumbs.db

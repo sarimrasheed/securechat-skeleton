@@ -10,6 +10,8 @@ Client workflow — implements:
 import socket
 import json
 import base64
+import os
+
 
 from app.crypto.pki import validate_peer_certificate_from_bytes
 from app.crypto.dh import (
@@ -52,7 +54,7 @@ def main():
 
     # 2. Send HELLO
     client_cert_pem = load_file(CLIENT_CERT_PATH)
-    client_nonce = base64.b64encode(b"client-nonce").decode()
+    client_nonce = base64.b64encode(os.urandom(16)).decode()
 
     hello_msg = {
         "type": "hello",
@@ -74,9 +76,10 @@ def main():
     msg = json.loads(data)
 
     if msg.get("type") == "BAD_CERT":
-        print("[CLIENT] Server rejected our cert: BAD_CERT")
+        print("[CLIENT] BAD_CERT:", msg.get("reason"))
         sock.close()
         return
+
 
     if msg.get("type") != "hello_ack":
         print("[CLIENT] Invalid response, expected hello_ack, got:", msg.get("type"))
@@ -96,6 +99,11 @@ def main():
 
     if not valid:
         print("[CLIENT] BAD_CERT – invalid server certificate")
+        bad = {"type": "BAD_CERT", "reason": "Invalid server certificate"}
+        try:
+            sock.sendall(json.dumps(bad).encode())
+        except:
+            pass
         sock.close()
         return
 

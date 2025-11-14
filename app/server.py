@@ -10,6 +10,8 @@ Server workflow — implements:
 import socket
 import json
 import base64
+import os
+
 
 from app.crypto.pki import validate_peer_certificate_from_bytes
 from app.crypto.dh import (
@@ -83,7 +85,12 @@ def main():
 
             if not valid:
                 print("[SERVER] BAD_CERT – closing connection.")
-                conn.sendall(b"BAD_CERT")
+                error_msg = {
+                     "type": "BAD_CERT",
+                     "reason": "Invalid client certificate"
+                }
+                conn.sendall(json.dumps(error_msg).encode())
+
                 conn.close()
                 continue
 
@@ -91,7 +98,7 @@ def main():
 
             # 4. Send HELLO_ACK with SERVER cert
             server_cert_pem = load_file(SERVER_CERT_PATH)
-            server_nonce = base64.b64encode(b"server-nonce").decode()
+            server_nonce = base64.b64encode(os.urandom(16)).decode()
 
             hello_ack = {
                 "type": "hello_ack",

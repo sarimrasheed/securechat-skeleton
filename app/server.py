@@ -1,20 +1,13 @@
 """
-SECURE CHAT SERVER
-Implements Option-C Requirements:
-1) Mutual certificate validation
-2) DH → AES-128 temporary login key
-3) Encrypted REGISTER + LOGIN
-4) Replay protection using timestamps
-5) Rejects stale / repeated encrypted messages
+SECURE CHAT SERVER — FINAL (A02 COMPLETE)
 """
 
 import socket
 import json
 import base64
 import os
-import time
 
-from dotenv import load_dotenv  # NEW
+from dotenv import load_dotenv
 
 from app.crypto.pki import validate_peer_certificate_from_bytes
 from app.crypto.dh import (
@@ -24,22 +17,26 @@ from app.crypto.dh import (
     derive_aes_key,
 )
 from app.crypto.aes import aes_decrypt_ecb
+from app.crypto.sign import rsa_verify, rsa_load_private_key
 from app.common.utils import now_ms, b64e, b64d
 
 from app.storage.db import create_user, verify_user
+from app.storage.transcript import (
+    append_entry,
+    compute_transcript_hash,
+    save_session_receipt,
+)
 
-# ---------------------------------------------------------
-# Load environment and config
-# ---------------------------------------------------------
-load_dotenv()  # NEW
+load_dotenv()
 
 SERVER_CERT_PATH = os.getenv("SERVER_CERT_PATH", "certs/server.cert.pem")
+SERVER_PRIV_KEY = os.getenv("SERVER_PRIVATE_KEY", "certs/server.key.pem")
 CA_CERT_PATH = os.getenv("CA_CERT_PATH", "certs/ca/ca.cert.pem")
 SERVER_HOST = os.getenv("SERVER_HOST", "localhost")
 SERVER_PORT = int(os.getenv("SERVER_PORT", 5555))
 
 
-def load_file(path: str) -> bytes:
+def load_file(path):
     with open(path, "rb") as f:
         return f.read()
 
@@ -63,25 +60,22 @@ def recv_json(conn):
 
 def main():
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.bind((SERVER_HOST, SERVER_PORT))  # UPDATED
+    server_socket.bind((SERVER_HOST, SERVER_PORT))
     server_socket.listen(5)
 
-    print(f"[SERVER] Listening on {SERVER_HOST}:{SERVER_PORT}...")  # UPDATED
+    print(f"[SERVER] Listening on {SERVER_HOST}:{SERVER_PORT}...")
 
     while True:
         conn, addr = server_socket.accept()
+        session_id = f"{addr[0]}_{addr[1]}_{now_ms()}"
+
         print(f"[SERVER] Connection from {addr}")
 
         try:
             # ------------------------------------------------------
-            # 1) HELLO + client certificate
+            # HELLO — validate client certificate
             # ------------------------------------------------------
             msg = recv_json(conn)
-            if not msg or msg.get("type") != "hello":
-                print("[SERVER] Invalid HELLO")
-                conn.close()
-                continue
-
             client_cert_pem = msg["cert"].encode()
 
             print("[SERVER] Validating client certificate...")
@@ -91,65 +85,48 @@ def main():
                 ca_cert_path=CA_CERT_PATH,
                 expected_hostname="client.local",
             )
-
             if not ok:
-                print("[SERVER] BAD_CERT")
                 conn.sendall(json.dumps({"type": "BAD_CERT"}).encode())
                 conn.close()
                 continue
 
             print("[SERVER] Certificate OK.")
 
-            # ------------------------------------------------------
-            # 2) HELLO_ACK + server certificate
-            # ------------------------------------------------------
+            # Send HELLO_ACK
             server_cert_pem = load_file(SERVER_CERT_PATH)
-            nonce = base64.b64encode(os.urandom(16)).decode()
-
-            hello_ack = {
+            conn.sendall(json.dumps({
                 "type": "hello_ack",
                 "cert": server_cert_pem.decode(),
-                "nonce": nonce,
+                "nonce": base64.b64encode(os.urandom(16)).decode(),
                 "ts": now_ms(),
-            }
-
-            conn.sendall(json.dumps(hello_ack).encode())
-            print("[SERVER] Sent HELLO_ACK")
+            }).encode())
 
             # ------------------------------------------------------
-            # 3) DH_INIT → compute shared AES key
+            # Temp DH → K_temp
             # ------------------------------------------------------
             dh_msg = recv_json(conn)
-            if not dh_msg or dh_msg.get("type") != "dh_init":
-                print("[SERVER] Expected dh_init")
-                conn.close()
-                continue
-
             client_pub = bytes_to_int(b64d(dh_msg["pub"]))
 
-            # Generate server DH
-            server_priv = dh_generate_private()
-            server_pub = dh_compute_public(server_priv)
+            s_priv = dh_generate_private()
+            s_pub = dh_compute_public(s_priv)
 
-            shared = dh_compute_shared(server_priv, client_pub)
+            shared = dh_compute_shared(s_priv, client_pub)
             k_temp = derive_aes_key(shared)
 
-            print(f"[SERVER] DH key established ({len(k_temp)} bytes).")
-
-            dh_reply = {
+            # Reply DH
+            conn.sendall(json.dumps({
                 "type": "dh_reply",
-                "pub": b64e(int_to_bytes(server_pub)),
+                "pub": b64e(int_to_bytes(s_pub)),
                 "ts": now_ms(),
-            }
+            }).encode())
 
-            conn.sendall(json.dumps(dh_reply).encode())
+            # Store client public key for signature verification
+            client_cert = load_file("certs/client.cert.pem").decode()
+            client_pub_key = rsa_load_private_key("certs/client.key.pem").publickey()
 
-            # ------------------------------------------------------
-            # 4) REPLAY PROTECTION
-            # ------------------------------------------------------
             last_seen_ts = 0
 
-            def check_replay(ts: int) -> bool:
+            def check_replay(ts):
                 nonlocal last_seen_ts
                 if ts <= last_seen_ts:
                     return False
@@ -157,73 +134,108 @@ def main():
                 return True
 
             # ------------------------------------------------------
-            # 5) Encrypted REGISTER
+            # REGISTER
             # ------------------------------------------------------
             msg = recv_json(conn)
-            if not msg or msg.get("type") != "enc" or msg.get("kind") != "register":
-                print("[SERVER] Expected encrypted REGISTER")
-                conn.close()
-                continue
-
             if not check_replay(msg["ts"]):
-                conn.sendall(json.dumps({"type": "REPLAY_DETECTED"}).encode())
-                conn.close()
+                conn.sendall(json.dumps({"type": "REPLAY"}).encode())
                 continue
 
-            reg_plain = aes_decrypt_ecb(k_temp, b64d(msg["ciphertext"]))
-            reg = json.loads(reg_plain.decode())
+            cipher = b64d(msg["ciphertext"])
+            sig = msg["sig"]
+            plain = aes_decrypt_ecb(k_temp, cipher)
 
-            print(f"[SERVER] REGISTER username={reg['username']}")
+            # Verify signature
+            if not rsa_verify("certs/client.cert.pem", plain, sig):
+                conn.sendall(json.dumps({"type": "SIG_FAIL"}).encode())
+                continue
+
+            reg = json.loads(plain.decode())
+            append_entry(session_id, {"dir": "client", **msg})
 
             ok = create_user(reg["email"], reg["username"], reg["password"])
-
-            conn.sendall(json.dumps(
-                {"type": "register_ok" if ok else "register_fail"}
-            ).encode())
+            conn.sendall(json.dumps({
+                "type": "register_ok" if ok else "register_fail"
+            }).encode())
 
             # ------------------------------------------------------
-            # 6) Encrypted LOGIN
+            # LOGIN
             # ------------------------------------------------------
             msg = recv_json(conn)
-            if not msg or msg.get("type") != "enc" or msg.get("kind") != "login":
-                print("[SERVER] Expected encrypted LOGIN")
-                conn.close()
-                continue
-
             if not check_replay(msg["ts"]):
-                conn.sendall(json.dumps({"type": "REPLAY_DETECTED"}).encode())
-                conn.close()
+                conn.sendall(json.dumps({"type": "REPLAY"}).encode())
                 continue
 
-            login_plain = aes_decrypt_ecb(k_temp, b64d(msg["ciphertext"]))
-            login = json.loads(login_plain.decode())
+            cipher = b64d(msg["ciphertext"])
+            sig = msg["sig"]
+            plain = aes_decrypt_ecb(k_temp, cipher)
 
-            print(f"[SERVER] LOGIN username={login['username']}")
+            if not rsa_verify("certs/client.cert.pem", plain, sig):
+                conn.sendall(json.dumps({"type": "SIG_FAIL"}).encode())
+                continue
+
+            login = json.loads(plain.decode())
+            append_entry(session_id, {"dir": "client", **msg})
 
             ok = verify_user(login["username"], login["password"])
-            conn.sendall(json.dumps(
-                {"type": "login_ok" if ok else "login_fail"}
-            ).encode())
+            conn.sendall(json.dumps({
+                "type": "login_ok" if ok else "login_fail"
+            }).encode())
 
             # ------------------------------------------------------
-            # 7) Replay attack test (client will repeat same LOGIN)
+            # Session DH → K_session
             # ------------------------------------------------------
-            replay = recv_json(conn)
-            if replay:
-                if not check_replay(replay["ts"]):
-                    print("[SERVER] Replay detected.")
-                    conn.sendall(json.dumps({"type": "REPLAY_DETECTED"}).encode())
-                else:
-                    conn.sendall(json.dumps({"type": "ERROR"}).encode())
+            info = recv_json(conn)
+            c2_pub = bytes_to_int(b64d(info["pub"]))
+
+            s2_priv = dh_generate_private()
+            s2_pub = dh_compute_public(s2_priv)
+
+            shared2 = dh_compute_shared(s2_priv, c2_pub)
+            k_session = derive_aes_key(shared2)
+
+            conn.sendall(json.dumps({
+                "type": "session_dh_reply",
+                "pub": b64e(int_to_bytes(s2_pub)),
+                "ts": now_ms(),
+            }).encode())
+
+            # ------------------------------------------------------
+            # Encrypted CHAT
+            # ------------------------------------------------------
+            msg = recv_json(conn)
+            append_entry(session_id, {"dir": "client", **msg})
+
+            # ------------------------------------------------------
+            # SessionReceipt (Signed)
+            # ------------------------------------------------------
+            th = compute_transcript_hash(session_id)
+
+            priv = rsa_load_private_key(SERVER_PRIV_KEY)
+            from Crypto.Signature import pkcs1_15
+            from Crypto.Hash import SHA256
+
+            h = SHA256.new(th.encode())
+            sig = pkcs1_15.new(priv).sign(h)
+
+            receipt = {
+                "client": "client.local",
+                "server": "server.local",
+                "transcript_hash": th,
+                "signed_by": "server",
+                "sig": base64.b64encode(sig).decode(),
+            }
+
+            save_session_receipt(session_id, receipt)
+            conn.sendall(json.dumps(receipt).encode())
 
             conn.close()
-            print("[SERVER] Connection closed.\n")
+            print("[SERVER] Session complete.\n")
 
         except Exception as e:
             print("[SERVER] Error:", e)
             conn.close()
 
-    server_socket.close()
 
 if __name__ == "__main__":
     main()

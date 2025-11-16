@@ -8,7 +8,7 @@ This module is responsible for:
 - Ensuring the Common Name (CN) or SAN matches the expected hostname
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from cryptography import x509
@@ -17,6 +17,10 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.x509.oid import NameOID, ExtensionOID
 
+
+# ---------------------------------------------------------
+# Certificate Loading
+# ---------------------------------------------------------
 
 def load_pem_certificate(path: str) -> x509.Certificate:
     """
@@ -35,11 +39,13 @@ def load_pem_certificate_from_bytes(pem_bytes: bytes) -> x509.Certificate:
     return x509.load_pem_x509_certificate(pem_bytes)
 
 
+# ---------------------------------------------------------
+# CA Signature Verification
+# ---------------------------------------------------------
+
 def verify_signed_by_ca(cert: x509.Certificate, ca_cert: x509.Certificate) -> bool:
     """
     Check that `cert` is signed by `ca_cert`.
-
-    This verifies the certificate's signature using the CA's public key.
     """
     try:
         ca_public_key = ca_cert.public_key()
@@ -53,22 +59,33 @@ def verify_signed_by_ca(cert: x509.Certificate, ca_cert: x509.Certificate) -> bo
     except InvalidSignature:
         return False
     except Exception:
-        # Any parsing / unexpected error -> treat as invalid
         return False
 
+
+# ---------------------------------------------------------
+# Validity Window (timezone-aware)
+# ---------------------------------------------------------
 
 def verify_validity_window(cert: x509.Certificate, now: datetime | None = None) -> bool:
     """
-    Check that the certificate is currently valid (not expired, not in the future).
+    Check that the certificate is currently valid.
+    Avoid offset-naive / offset-aware comparison issues.
     """
+
+    # Always use timezone-aware UTC timestamp
     if now is None:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
-    # If now is outside [not_valid_before, not_valid_after], cert is invalid.
-    if now < cert.not_valid_before_utc or now > cert.not_valid_after_utc:
-        return False
-    return True
+    # Convert cert fields to timezone-aware versions
+    not_before = cert.not_valid_before.replace(tzinfo=timezone.utc)
+    not_after = cert.not_valid_after.replace(tzinfo=timezone.utc)
 
+    return not_before <= now <= not_after
+
+
+# ---------------------------------------------------------
+# CN / SAN Validation
+# ---------------------------------------------------------
 
 def extract_common_name(cert: x509.Certificate) -> str | None:
     """
@@ -85,16 +102,15 @@ def extract_common_name(cert: x509.Certificate) -> str | None:
 
 def extract_dns_san_names(cert: x509.Certificate) -> list[str]:
     """
-    Extract DNS names from the Subject Alternative Name (SAN) extension, if present.
+    Extract DNS names from the Subject Alternative Name (SAN), if present.
     """
     names: list[str] = []
     try:
         san = cert.extensions.get_extension_for_oid(ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
-        san = san.value  # SubjectAlternativeName
+        san = san.value
         for entry in san.get_values_for_type(x509.DNSName):
             names.append(entry)
     except x509.ExtensionNotFound:
-        # SAN not present is not fatal, we just return an empty list
         return names
     except Exception:
         return names
@@ -104,10 +120,7 @@ def extract_dns_san_names(cert: x509.Certificate) -> list[str]:
 
 def verify_name_matches(cert: x509.Certificate, expected_hostname: str) -> bool:
     """
-    Check that either:
-    - CN == expected_hostname
-    OR
-    - expected_hostname is present in SAN DNS names.
+    Ensure certificate CN or SAN DNS contains expected hostname.
     """
     cn = extract_common_name(cert)
     if cn == expected_hostname:
@@ -120,41 +133,36 @@ def verify_name_matches(cert: x509.Certificate, expected_hostname: str) -> bool:
     return False
 
 
+# ---------------------------------------------------------
+# Main Validation Entry Point
+# ---------------------------------------------------------
+
 def validate_peer_certificate_from_bytes(
     peer_cert_pem: bytes,
     ca_cert_path: str,
     expected_hostname: str,
 ) -> bool:
     """
-    MAIN ENTRY POINT for client/server code.
-
-    Parameters:
-        peer_cert_pem: the PEM-encoded certificate bytes received from the peer.
-        ca_cert_path: path to our Root CA certificate (e.g. 'certs/ca/ca.cert.pem').
-        expected_hostname: what we expect in CN / SAN (e.g. 'server.local').
-
-    Returns:
-        True if the peer certificate is:
-            - signed by our CA
-            - currently valid
-            - CN or SAN matches expected_hostname
-        False otherwise.
+    Validate that the peer certificate is:
+    - Signed by our CA
+    - Within the validity period
+    - CN/SAN matches expected hostname
     """
-    # 1) Load peer cert from PEM bytes
+    # Load peer certificate
     peer_cert = load_pem_certificate_from_bytes(peer_cert_pem)
 
-    # 2) Load our trusted CA certificate from disk
+    # Load trusted CA certificate
     ca_cert = load_pem_certificate(ca_cert_path)
 
-    # 3) Verify signature chain (peer signed by CA)
+    # 1) Signature chain
     if not verify_signed_by_ca(peer_cert, ca_cert):
         return False
 
-    # 4) Verify validity window
+    # 2) Validity window (timezone-aware)
     if not verify_validity_window(peer_cert):
         return False
 
-    # 5) Verify CN or SAN matches expected hostname
+    # 3) CN or SAN must match expected hostname
     if not verify_name_matches(peer_cert, expected_hostname):
         return False
 

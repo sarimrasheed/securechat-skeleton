@@ -65,7 +65,7 @@ def verify_validity_window(cert: x509.Certificate, now: datetime | None = None) 
         now = datetime.utcnow()
 
     # If now is outside [not_valid_before, not_valid_after], cert is invalid.
-    if now < cert.not_valid_before or now > cert.not_valid_after:
+    if now < cert.not_valid_before_utc or now > cert.not_valid_after_utc:
         return False
     return True
 

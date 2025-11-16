@@ -1,10 +1,12 @@
 """
-Client workflow — implements:
-1) Connect to server
-2) Send HELLO (+ client cert)
-3) Receive HELLO_ACK (+ server cert)
-4) Validate server certificate
-5) Perform temporary Diffie–Hellman to derive AES-128 login key
+SECURE CHAT CLIENT
+Implements:
+1) HELLO + certificate
+2) Validate server cert
+3) DH → AES-128 login key
+4) Encrypted REGISTER
+5) Encrypted LOGIN
+6) Replay LOGIN (to test REPLAY protection)
 """
 
 import socket
@@ -12,6 +14,7 @@ import json
 import base64
 import os
 
+from dotenv import load_dotenv   # NEW
 
 from app.crypto.pki import validate_peer_certificate_from_bytes
 from app.crypto.dh import (
@@ -20,143 +23,160 @@ from app.crypto.dh import (
     dh_compute_shared,
     derive_aes_key,
 )
+from app.crypto.aes import aes_encrypt_ecb
 from app.common.utils import now_ms, b64e, b64d
 
 
-CLIENT_CERT_PATH = "certs/client.cert.pem"
-CLIENT_KEY_PATH = "certs/client.key.pem"
-CA_CERT_PATH = "certs/ca/ca.cert.pem"
+# ---------------------------------------------------------
+# Load environment variables
+# ---------------------------------------------------------
+load_dotenv()   # NEW
+
+CLIENT_CERT_PATH = os.getenv("CLIENT_CERT_PATH", "certs/client.cert.pem")
+CA_CERT_PATH     = os.getenv("CA_CERT_PATH", "certs/ca/ca.cert.pem")
+SERVER_HOST      = os.getenv("SERVER_HOST", "localhost")
+SERVER_PORT      = int(os.getenv("SERVER_PORT", 5555))
 
 
-def load_file(path: str) -> bytes:
+def load_file(path: str):
     with open(path, "rb") as f:
         return f.read()
 
 
 def int_to_bytes(n: int) -> bytes:
-    """Convert integer to big-endian bytes."""
     if n == 0:
         return b"\x00"
     return n.to_bytes((n.bit_length() + 7) // 8, "big")
 
 
 def bytes_to_int(b: bytes) -> int:
-    """Convert big-endian bytes to integer."""
     return int.from_bytes(b, "big")
 
 
-def main():
-    # 1. Connect to server
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.connect(("localhost", 5555))
+def send_enc(sock, key, kind, payload):
+    plain = json.dumps(payload).encode()
+    cipher = aes_encrypt_ecb(key, plain)
 
-    print("[CLIENT] Connected to server.")
-
-    # 2. Send HELLO
-    client_cert_pem = load_file(CLIENT_CERT_PATH)
-    client_nonce = base64.b64encode(os.urandom(16)).decode()
-
-    hello_msg = {
-        "type": "hello",
-        "cert": client_cert_pem.decode(),
-        "nonce": client_nonce,
+    msg = {
+        "type": "enc",
+        "kind": kind,
+        "ciphertext": b64e(cipher),
         "ts": now_ms(),
     }
+    sock.sendall(json.dumps(msg).encode())
 
-    sock.sendall(json.dumps(hello_msg).encode())
+
+def recv_json(sock):
+    data = sock.recv(20000)
+    if not data:
+        return None
+    return json.loads(data.decode())
+
+
+def main():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.connect((SERVER_HOST, SERVER_PORT))
+    print(f"[CLIENT] Connected to {SERVER_HOST}:{SERVER_PORT}.")
+
+    # ------------------------------------------------
+    # 1) HELLO
+    # ------------------------------------------------
+    cert = load_file(CLIENT_CERT_PATH)
+    hello = {
+        "type": "hello",
+        "cert": cert.decode(),
+        "nonce": base64.b64encode(os.urandom(16)).decode(),
+        "ts": now_ms(),
+    }
+    sock.sendall(json.dumps(hello).encode())
     print("[CLIENT] HELLO sent.")
 
-    # 3. Receive HELLO_ACK
-    data = sock.recv(10000).decode()
-    if not data:
-        print("[CLIENT] No HELLO_ACK received, closing.")
-        sock.close()
+    # ------------------------------------------------
+    # 2) HELLO_ACK
+    # ------------------------------------------------
+    ack = recv_json(sock)
+    if ack["type"] != "hello_ack":
+        print("[CLIENT] Bad HELLO_ACK")
         return
 
-    msg = json.loads(data)
-
-    if msg.get("type") == "BAD_CERT":
-        print("[CLIENT] BAD_CERT:", msg.get("reason"))
-        sock.close()
-        return
-
-
-    if msg.get("type") != "hello_ack":
-        print("[CLIENT] Invalid response, expected hello_ack, got:", msg.get("type"))
-        sock.close()
-        return
-
-    server_cert_pem = msg["cert"].encode()
-
-    # 4. Validate server certificate
     print("[CLIENT] Validating server certificate...")
 
-    valid = validate_peer_certificate_from_bytes(
-        peer_cert_pem=server_cert_pem,
+    ok = validate_peer_certificate_from_bytes(
+        ack["cert"].encode(),
         ca_cert_path=CA_CERT_PATH,
-        expected_hostname="server.local",
+        expected_hostname="server.local"
     )
 
-    if not valid:
-        print("[CLIENT] BAD_CERT – invalid server certificate")
-        bad = {"type": "BAD_CERT", "reason": "Invalid server certificate"}
-        try:
-            sock.sendall(json.dumps(bad).encode())
-        except:
-            pass
-        sock.close()
+    if not ok:
+        print("[CLIENT] BAD_CERT")
         return
 
-    print("[CLIENT] Server certificate OK.")
+    print("[CLIENT] Server cert OK.")
 
-    # 5. Perform temporary Diffie–Hellman exchange
-    print("[CLIENT] Starting temporary DH key exchange...")
-
-    # Generate client DH private/public
+    # ------------------------------------------------
+    # 3) DH Init
+    # ------------------------------------------------
     client_priv = dh_generate_private()
-    client_pub_int = dh_compute_public(client_priv)
-    client_pub_bytes = int_to_bytes(client_pub_int)
-    client_pub_b64 = b64e(client_pub_bytes)
+    client_pub = dh_compute_public(client_priv)
 
     dh_init = {
         "type": "dh_init",
-        "pub": client_pub_b64,
+        "pub": b64e(int_to_bytes(client_pub)),
         "ts": now_ms(),
     }
 
     sock.sendall(json.dumps(dh_init).encode())
-    print("[CLIENT] Sent dh_init to server.")
+    print("[CLIENT] Sent dh_init.")
 
-    # Receive server DH reply
-    data = sock.recv(10000).decode()
-    if not data:
-        print("[CLIENT] No dh_reply received, closing.")
-        sock.close()
-        return
+    # ------------------------------------------------
+    # 4) DH Reply
+    # ------------------------------------------------
+    reply = recv_json(sock)
+    server_pub = bytes_to_int(b64d(reply["pub"]))
 
-    dh_reply = json.loads(data)
-    if dh_reply.get("type") != "dh_reply":
-        print("[CLIENT] Expected dh_reply, got:", dh_reply.get("type"))
-        sock.close()
-        return
+    shared = dh_compute_shared(client_priv, server_pub)
+    k_temp = derive_aes_key(shared)
 
-    print("[CLIENT] Received dh_reply from server.")
+    print(f"[CLIENT] DH key established ({len(k_temp)} bytes).")
 
-    server_pub_b64 = dh_reply["pub"]
-    server_pub_bytes = b64d(server_pub_b64)
-    server_pub_int = bytes_to_int(server_pub_bytes)
+    # ------------------------------------------------
+    # 5) REGISTER
+    # ------------------------------------------------
+    reg = {
+        "email": "alice@example.com",
+        "username": "alice",
+        "password": "password123",
+    }
 
-    # Compute shared secret
-    shared_secret = dh_compute_shared(client_priv, server_pub_int)
-    k_temp = derive_aes_key(shared_secret)
+    print("[CLIENT] Sending encrypted REGISTER...")
+    send_enc(sock, k_temp, "register", reg)
 
-    print(f"[CLIENT] Temporary DH key established (len={len(k_temp)} bytes).")
+    print("[CLIENT] REGISTER response:", recv_json(sock))
 
-    # NOTE: Next phase will use k_temp for encrypted registration/login.
-    # For now, we close connection after verifying DH works.
+    # ------------------------------------------------
+    # 6) LOGIN
+    # ------------------------------------------------
+    login = {
+        "username": "alice",
+        "password": "password123",
+    }
+
+    print("[CLIENT] Sending encrypted LOGIN...")
+    send_enc(sock, k_temp, "login", login)
+
+    print("[CLIENT] LOGIN response:", recv_json(sock))
+
+    # ------------------------------------------------
+    # 7) REPLAY attack
+    # ------------------------------------------------
+    print("[CLIENT] Sending REPLAYED LOGIN...")
+    send_enc(sock, k_temp, "login", login)
+
+    print("[CLIENT] Replay response:", recv_json(sock))
+
     sock.close()
-    print("[CLIENT] Connection closed after temporary DH.")
-
+    print("[CLIENT] Closed.")
 
 if __name__ == "__main__":
     main()
+

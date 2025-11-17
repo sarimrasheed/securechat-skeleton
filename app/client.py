@@ -1,15 +1,5 @@
 """
-SECURE CHAT CLIENT — FINAL (A02 COMPLETE)
-
-Implements:
-1) HELLO + cert
-2) Validate server certificate
-3) Temp DH → K_temp
-4) REGISTER (signed + encrypted)
-5) LOGIN (signed + encrypted)
-6) Session DH → K_session
-7) Encrypted CHAT message (signed)
-8) Receive SessionReceipt
+SECURE CHAT CLIENT — FINAL (A02 COMPLETE & MATCHED WITH SERVER)
 """
 
 import socket
@@ -45,9 +35,7 @@ def load_file(path: str):
 
 
 def int_to_bytes(n: int) -> bytes:
-    if n == 0:
-        return b"\x00"
-    return n.to_bytes((n.bit_length() + 7) // 8, "big")
+    return n.to_bytes((n.bit_length() + 7) // 8, "big") if n else b"\x00"
 
 
 def bytes_to_int(b: bytes) -> int:
@@ -55,7 +43,10 @@ def bytes_to_int(b: bytes) -> int:
 
 
 def send_signed_encrypted(sock, key, kind, payload):
-    """Encrypt JSON + attach RSA signature."""
+    """
+    Encrypt JSON and attach RSA signature.
+    Returns the message dict (used for replay test).
+    """
     plain = json.dumps(payload).encode()
     sig = rsa_sign(CLIENT_PRIV_KEY, plain)
     cipher = aes_encrypt_ecb(key, plain)
@@ -67,7 +58,9 @@ def send_signed_encrypted(sock, key, kind, payload):
         "sig": sig,
         "ts": now_ms(),
     }
+
     sock.sendall(json.dumps(msg).encode())
+    return msg
 
 
 def recv_json(sock):
@@ -86,27 +79,48 @@ def main():
     # HELLO
     # --------------------------------------------------
     cert = load_file(CLIENT_CERT_PATH)
+
     hello = {
         "type": "hello",
         "cert": cert.decode(),
-        "nonce": base64.b64encode(os.urandom(16)).decode(),
+        "nonce": b64e(os.urandom(16)),
         "ts": now_ms(),
     }
+
     sock.sendall(json.dumps(hello).encode())
     print("[CLIENT] HELLO sent.")
 
     # --------------------------------------------------
-    # HELLO_ACK
+    # HELLO_ACK + BAD_CERT HANDLING
     # --------------------------------------------------
     ack = recv_json(sock)
+
+    if ack is None:
+        print("[CLIENT] No HELLO_ACK received — aborting.")
+        sock.close()
+        return
+
+    if ack.get("type") == "BAD_CERT":
+        print("[CLIENT] Server rejected our certificate (BAD_CERT).")
+        sock.close()
+        return
+
+    if "cert" not in ack:
+        print("[CLIENT] HELLO_ACK missing certificate — aborting.")
+        sock.close()
+        return
+
     print("[CLIENT] Validating server certificate...")
+
     ok = validate_peer_certificate_from_bytes(
         ack["cert"].encode(),
         ca_cert_path=CA_CERT_PATH,
         expected_hostname="server.local",
     )
+
     if not ok:
-        print("[CLIENT] BAD_CERT — aborting")
+        print("[CLIENT] BAD_CERT — aborting.")
+        sock.close()
         return
 
     print("[CLIENT] Server cert OK.")
@@ -117,17 +131,24 @@ def main():
     client_priv = dh_generate_private()
     client_pub = dh_compute_public(client_priv)
 
-    dh_init = {
+    sock.sendall(json.dumps({
         "type": "dh_init",
         "pub": b64e(int_to_bytes(client_pub)),
-        "ts": now_ms(),
-    }
-    sock.sendall(json.dumps(dh_init).encode())
+        "ts": now_ms()
+    }).encode())
 
     dh_reply = recv_json(sock)
-    server_pub = bytes_to_int(b64d(dh_reply["pub"]))
 
-    shared = dh_compute_shared(client_priv, server_pub)
+    if dh_reply is None:
+        print("[CLIENT] No DH reply — aborting.")
+        sock.close()
+        return
+
+    shared = dh_compute_shared(
+        client_priv,
+        bytes_to_int(b64d(dh_reply["pub"]))
+    )
+
     k_temp = derive_aes_key(shared)
     print("[CLIENT] K_temp established (login key).")
 
@@ -153,23 +174,58 @@ def main():
     }
 
     print("[CLIENT] Sending LOGIN...")
-    send_signed_encrypted(sock, k_temp, "login", login)
+    login_msg = send_signed_encrypted(sock, k_temp, "login", login)
     print("[CLIENT] LOGIN response:", recv_json(sock))
+
+    # --------------------------------------------------
+    # SIG_FAIL test — tamper ciphertext
+    # --------------------------------------------------
+    print("[CLIENT] Sending TAMPERED encrypted LOGIN...")
+
+    tampered = login_msg.copy()
+    tampered["ciphertext"] = tampered["ciphertext"][:-4] + "ABCD"  # BREAK ciphertext
+
+    sock.sendall(json.dumps(tampered).encode())
+
+    sig_fail_resp = recv_json(sock)
+    print("[CLIENT] SIG_FAIL response:", sig_fail_resp)
+
+    # --------------------------------------------------
+    # REPLAY TEST
+    # --------------------------------------------------
+    print("[CLIENT] Sending REPLAYED LOGIN...")
+    sock.sendall(json.dumps(login_msg).encode())
+
+    replay_resp = recv_json(sock)
+    print("[CLIENT] Replay response:", replay_resp)
+
+    if replay_resp is None:
+        print("[CLIENT] Server closed connection during replay test.")
+        sock.close()
+        return
 
     # --------------------------------------------------
     # Session DH → K_session
     # --------------------------------------------------
     print("[CLIENT] Performing Session DH...")
+
     c2_priv = dh_generate_private()
     c2_pub = dh_compute_public(c2_priv)
 
     sock.sendall(json.dumps({
         "type": "session_dh_init",
-        "pub": b64e(int_to_bytes(c2_pub)),
-        "ts": now_ms(),
+        #"pub": b64e(int_to_bytes(c2_pub)),
+        "pub": "INVALID_PUB_VALUE",
+        "ts": now_ms()
     }).encode())
 
     reply = recv_json(sock)
+
+    if reply is None:
+        print("[CLIENT] Server closed connection unexpectedly.")
+        sock.close()
+        return
+
     s2_pub = bytes_to_int(b64d(reply["pub"]))
     shared2 = dh_compute_shared(c2_priv, s2_pub)
     k_session = derive_aes_key(shared2)
@@ -177,14 +233,14 @@ def main():
     print("[CLIENT] K_session established.")
 
     # --------------------------------------------------
-    # Encrypted CHAT message
+    # Encrypted CHAT
     # --------------------------------------------------
     message = {"msg": "Hello secure world!"}
     print("[CLIENT] Sending encrypted CHAT...")
     send_signed_encrypted(sock, k_session, "chat", message)
 
     # --------------------------------------------------
-    # Receive SessionReceipt
+    # SessionReceipt
     # --------------------------------------------------
     receipt = recv_json(sock)
     print("[CLIENT] SessionReceipt received:")

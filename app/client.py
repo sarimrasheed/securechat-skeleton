@@ -153,25 +153,27 @@ def main():
     print("[CLIENT] K_temp established (login key).")
 
     # --------------------------------------------------
-    # REGISTER
+    # REGISTER (Dynamic Input)
     # --------------------------------------------------
-    reg = {
-        "email": "alice@example.com",
-        "username": "alice",
-        "password": "password123",
-    }
+    print("\n=== REGISTER ===")
+    email = input("Enter email: ")
+    username = input("Enter username: ")
+    password = input("Enter password: ")
+
+    reg = {"email": email, "username": username, "password": password}
 
     print("[CLIENT] Sending REGISTER...")
     send_signed_encrypted(sock, k_temp, "register", reg)
     print("[CLIENT] REGISTER response:", recv_json(sock))
 
     # --------------------------------------------------
-    # LOGIN
+    # LOGIN (Dynamic Input)
     # --------------------------------------------------
-    login = {
-        "username": "alice",
-        "password": "password123",
-    }
+    print("\n=== LOGIN ===")
+    login_user = input("Enter username: ")
+    login_pass = input("Enter password: ")
+
+    login = {"username": login_user, "password": login_pass}
 
     print("[CLIENT] Sending LOGIN...")
     login_msg = send_signed_encrypted(sock, k_temp, "login", login)
@@ -183,10 +185,9 @@ def main():
     print("[CLIENT] Sending TAMPERED encrypted LOGIN...")
 
     tampered = login_msg.copy()
-    tampered["ciphertext"] = tampered["ciphertext"][:-4] + "ABCD"  # BREAK ciphertext
+    tampered["ciphertext"] = tampered["ciphertext"][:-4] + "ABCD"
 
     sock.sendall(json.dumps(tampered).encode())
-
     sig_fail_resp = recv_json(sock)
     print("[CLIENT] SIG_FAIL response:", sig_fail_resp)
 
@@ -195,7 +196,6 @@ def main():
     # --------------------------------------------------
     print("[CLIENT] Sending REPLAYED LOGIN...")
     sock.sendall(json.dumps(login_msg).encode())
-
     replay_resp = recv_json(sock)
     print("[CLIENT] Replay response:", replay_resp)
 
@@ -214,8 +214,7 @@ def main():
 
     sock.sendall(json.dumps({
         "type": "session_dh_init",
-        #"pub": b64e(int_to_bytes(c2_pub)),
-        "pub": "INVALID_PUB_VALUE",
+        "pub": "INVALID_PUB_VALUE",  # For DH ERROR TEST
         "ts": now_ms()
     }).encode())
 

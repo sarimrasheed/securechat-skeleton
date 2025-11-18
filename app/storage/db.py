@@ -16,9 +16,9 @@ import hmac
 import pymysql
 from dotenv import load_dotenv
 
-load_dotenv()  # load .env variables
+load_dotenv()  
 
-# -------- DB CONFIG FROM .env ---------
+
 
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = int(os.getenv("DB_PORT", 3306))
